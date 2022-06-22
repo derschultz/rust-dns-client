@@ -6,7 +6,7 @@ use std::net::UdpSocket;
 //use std::ops::RangeInclusive;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ArgEnum)]
-enum QType { // not exhaustive. also used to map to decimal values for pkts.
+enum QType { // not exhaustive. also used to map to decimal values for making pkts.
     A = 1,
     AAAA = 28,
     NS = 2,
@@ -16,6 +16,23 @@ enum QType { // not exhaustive. also used to map to decimal values for pkts.
     CNAME = 5,
     TXT = 16,
     ANY = 255
+}
+
+impl QType {
+    fn from_u16(value: u16) -> QType {
+        match value {
+            1 => QType::A,
+            2 => QType::NS,
+            5 => QType::CNAME,
+            15 => QType::MX,
+            16 => QType::TXT,
+            28 => QType::AAAA,
+            64 => QType::SVCB,
+            65 => QType::HTTPS,
+            255 => QType::ANY,
+            _ => panic!("Unknown value {} for conversion to QType!", value),
+        }
+    }
 }
 
 /* unneeded, since enums can have values associated with each variant (above) - see
@@ -163,8 +180,8 @@ fn make_qname_string(qname: &String) -> Vec<u8> {
 fn make_query(args: &Arguments) -> Vec<u8> {
     let mut ret : Vec<u8> = Vec::new();
     let mut rng = rand::thread_rng();
-    // layout from https://routley.io/posts/hand-writing-dns-messages/
 
+    // layout from https://routley.io/posts/hand-writing-dns-messages/
 
     // header
     let qid = rng.gen::<u16>();
@@ -189,18 +206,20 @@ fn make_query(args: &Arguments) -> Vec<u8> {
     ret
 }
 
+#[derive(Debug)]
 struct QuestionRecord {
     name: String,
     qtype: QType,
     class: u16
 }
 
+#[derive(Debug)]
 struct ResourceRecord {
     name: String,
     rtype: QType,
     class: u16,
     ttl: u32,
-    rdata: Vec<u8> // TODO make this into an enum based on the type of the data.
+    rdata: Vec<u8>
 }
 
 struct ResponsePacketStruct {
@@ -212,19 +231,41 @@ struct ResponsePacketStruct {
     additionals: Vec<ResourceRecord>
 }
 
-fn parse_question_records(buf: &[u8], count: u16, q: &mut Vec<QuestionRecord>) -> Result<u32, String> {
-    Ok(0) // TODO implement
+fn parse_question_records(buf: &[u8], offset: &mut usize, count: u16, q: &mut Vec<QuestionRecord>) -> Result<usize, String> {
+    // qname (variable len), then 4 bytes (2 for qtype and 2 for qclass)
+    
+    let mut byte = 0u8; // for reading single-byte length
+    let mut twobytes = [0u8, 0u8]; // for reading qtype/qclass
+
+    for _ in 0 .. count { // handle multiple question records, even if multiples are rare.
+        let mut labels: Vec<String> = Vec::new();
+        // TODO handle message compression: https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.4
+        loop { // pull label len, then label. repeat as necessary
+            byte = buf[*offset];
+            // TODO if byte >= 64, then we have message compression to handle. see above.
+            *offset += 1;
+            if byte == 0 { break; } // null byte - stop processing the qname.
+            // pull labels off, using length in byte.
+            // TODO bounds checking on buf w.r.t. the length in byte
+            let label = &buf[*offset .. *offset + (byte as usize)];
+            labels.push(String::from_utf8(label.to_vec()).unwrap()); // TODO validate bytes to utf8?
+            *offset += byte as usize;
+        }
+        let name = labels.join(".");
+        // TODO bounds checking for the last 4 bytes.
+        twobytes.clone_from_slice(&buf[*offset .. *offset+2]);
+        let qtype = u16::from_be_bytes(twobytes);
+        *offset += 2;
+        twobytes.clone_from_slice(&buf[*offset .. *offset+2]);
+        let qclass = u16::from_be_bytes(twobytes);
+        *offset += 2;
+        q.push(QuestionRecord {name: name, qtype: QType::from_u16(qtype), class: qclass});
+    }
+        
+    Ok(*offset)
 }
 
-fn parse_answer_records(buf: &[u8], count: u16, a: &mut Vec<QuestionRecord>) -> Result<u32, String> {
-    Ok(0) // TODO implement
-}
-
-fn parse_auth_records(buf: &[u8], count: u16, a: &mut Vec<QuestionRecord>) -> Result<u32, String> {
-    Ok(0) // TODO implement
-}
-
-fn parse_additional_records(buf: &[u8], count: u16, a: &mut Vec<QuestionRecord>) -> Result<u32, String> {
+fn parse_resource_records(buf: &[u8], offset: &mut usize, count: u16, a: &mut Vec<ResourceRecord>) -> Result<usize, String> {
     Ok(0) // TODO implement
 }
 
@@ -238,6 +279,7 @@ fn parse_response_packet(buf: &[u8]) -> Result<ResponsePacketStruct, String> {
     let mut auths: Vec<ResourceRecord> = Vec::new();
     let mut additionals: Vec<ResourceRecord> = Vec::new();
 
+    // header
     let mut twobytes = [0u8, 0u8];
     twobytes.clone_from_slice(&buf[0 .. 2]);
     let qid = u16::from_be_bytes(twobytes);
@@ -253,9 +295,7 @@ fn parse_response_packet(buf: &[u8]) -> Result<ResponsePacketStruct, String> {
     let addcount = u16::from_be_bytes(twobytes);
 
     if buf.len() == 12 {
-        // if end of buf right after header, ignore any counts we read - 
-        // they don't exist in the buffer. set those counts to 0 in the returned var
-        // and return immediately.
+        // if end of buf right after header, return now.
         return Ok(ResponsePacketStruct { 
             qid:qid, flags:flags,
             questions:questions, answers:answers, 
@@ -263,22 +303,28 @@ fn parse_response_packet(buf: &[u8]) -> Result<ResponsePacketStruct, String> {
     }
 
     let mut offset: usize = 12; // records (question and resources) follow
-    match parse_question_records(&buf[offset..], qcount, &mut questions) {
-        Ok(count) => { offset += count as usize },
+
+    match parse_question_records(&buf, &mut offset, qcount, &mut questions) {
+        Ok(_) => {},
         Err(s) => return Err(s)
     }
-    match parse_answer_records(&buf[offset..], ancount, &mut answers) {
-        Ok(count) => { offset += count as usize },
+
+    match parse_resource_records(&buf, &mut offset, ancount, &mut answers) {
+        Ok(_) => { },
         Err(s) => return Err(s)
     }
-    match parse_auth_records(&buf[offset..], authcount, &mut auths) {
-        Ok(count) => { offset += count as usize },
+
+    match parse_resource_records(&buf, &mut offset, authcount, &mut auths) {
+        Ok(_) => { },
         Err(s) => return Err(s)
     }
-    match parse_additional_records(&buf[offset..], addcount, &mut additionals) {
-        Ok(count) => { offset += count as usize },
+
+    match parse_resource_records(&buf, &mut offset, addcount, &mut additionals) {
+        Ok(_) => { },
         Err(s) => return Err(s)
     }
+
+    // TODO what if we have excess bytes after processing all the sections above?
 
     Ok(ResponsePacketStruct { 
         qid: qid, flags: flags, 
@@ -290,11 +336,24 @@ fn print_response(r: ResponsePacketStruct) {
     println!("Got a response:");
     println!("  QID = {:#X}", r.qid); // uppercase hex with preceding 0x
     println!("  flags = {:b}", r.flags); // binary w/out preceding 0b
+    /*
     println!("  qcount = {}", r.questions.len());
     println!("  ancount = {}", r.answers.len());
     println!("  authcount = {}", r.auths.len());
     println!("  addcount = {}", r.additionals.len());
-    // TODO output records
+    */
+    for qr in r.questions {
+        println!("  {:?}", qr);
+    }
+    for rr in r.answers {
+        println!("  {:?}", rr);
+    }
+    for rr in r.auths {
+        println!("  {:?}", rr);
+    }
+    for rr in r.additionals {
+        println!("  {:?}", rr);
+    }
 }
 
 fn main() {
