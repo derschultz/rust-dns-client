@@ -160,6 +160,41 @@ struct Arguments {
     qtype: QType,
 }
 
+/* given an offset into a packet, read the name encoded at offset, handling
+   message compressing as described in https://datatracker.ietf.org/doc/html/rfc1035#section-4.1.4 .
+   TODO keep track of depth of call stack here - for compression, we can recursively
+   call this function, possibly many times, which we should limit.
+   TODO memoize the return values of this function. it's possible for multiple names have 
+*/
+fn parse_name_string(buf: &[u8], offset: usize) -> Result<String,String> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut offset = offset;
+    let mut twobytes = [0u8, 0u8]; // for holding u16
+    loop {
+        let lenbyte = buf[offset];
+        offset += 1;
+        if lenbyte == 0 { // null byte - end of labels.
+            break;
+        } else if (lenbyte & 0xC0u8) != 0 { // 2 leading bits set - this is a ptr to elsewhere in the pkt.
+            twobytes.clone_from_slice(&buf[offset - 1] .. &buf[offset + 1]);
+            let mut coffset: u16 = u16::from_be_bytes(twobytes);
+            offset += 1;
+            match parse_name_string(&buf, offset as usize) {
+                Ok(s) => labels.push_back(s),
+                Err(e) => return Err(e)
+            }
+        } else if ((lenbyte & 0x80u8) != 0) || ((lenbyte & 0x40u8) != 0) {
+            /* according to RFC1035, these are reserved for future use. 
+               for now, return an Err if we encounter these. */
+            return Err(String::from("Found 10/01 leading bits in name len byte."));
+
+        } else { // normal name 
+            // TODO copy implementation from parse_question_records below up here.
+        }
+    }
+    Ok(labels.join("."))
+}
+
 fn make_qname_string(qname: &String) -> Vec<u8> {
     let mut ret : Vec<u8> = Vec::new();
     let mut qname_copy = qname.clone();
